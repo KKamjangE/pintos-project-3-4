@@ -35,6 +35,9 @@ static int read (int fd, void *buffer, unsigned length);
 static int write (int fd, const void *buffer, unsigned length);
 static void seek (int fd, unsigned position);
 static unsigned tell (int fd);
+static void *mmap (void *addr, size_t length, int writable, int fd, off_t offset);
+static bool is_invalid_mmap(void *addr, size_t length, int fd);
+static void munmap(void *addr);
 static bool is_invalid_fd(int fd);
 static void intr_frame_cpy(struct intr_frame *f);
 static void check_read_write(void *addr);
@@ -138,6 +141,13 @@ syscall_handler (struct intr_frame *f) {
 	case SYS_CLOSE:
 		close(f->R.rdi);
 		break;
+	
+	case SYS_MMAP:
+		f->R.rax = mmap(f->R.rdi, f->R.rsi, f->R.rdx, f->R.r10, f->R.r8);
+	    break;
+
+	case SYS_MUNMAP:
+	    break;
 
 	default:
 		thread_exit ();
@@ -164,7 +174,7 @@ static void check_read_write(void *addr){
 	}
 }
 
-void
+static void
 halt (void) {
 	power_off();
 }
@@ -177,13 +187,13 @@ exit (int status) {
 	thread_exit();
 }
 
-pid_t
+static pid_t
 fork (const char *thread_name) {
 	pid_t pid = process_fork(thread_name, &thread_current()->user_tf);
 	return pid;
 }
 
-int
+static int
 exec (const char *cmd_line) {
 	char *cmd_line_cpy = palloc_get_page(PAL_ZERO);
 	if (!cmd_line_cpy) {
@@ -201,22 +211,22 @@ exec (const char *cmd_line) {
 	return 1;
 }
 
-int
+static int
 wait (pid_t pid) {
 	return process_wait(pid);
 }
 
-bool
+static bool
 create (const char *file, unsigned initial_size) {
 	return filesys_create(file, initial_size);
 }
 
-bool
+static bool
 remove (const char *file) {
 	return filesys_remove(file);
 }
 
-int
+static int
 open (const char *file) {
 
 	struct thread *curr_t = thread_current();
@@ -240,7 +250,7 @@ open (const char *file) {
 	}
 }
 
-int
+static int
 filesize (int fd) {
 	struct thread *curr_t = thread_current();
 	struct file *file_p = curr_t->fdt[fd];
@@ -250,7 +260,7 @@ filesize (int fd) {
 	return file_length(file_p);
 }
 
-int
+static int
 read (int fd, void *buffer, unsigned size) {
 
 	if (fd == STDIN_FILENO)
@@ -294,7 +304,7 @@ read (int fd, void *buffer, unsigned size) {
 	}
 }
 
-int
+static int
 write (int fd, const void *buffer, unsigned size) {
 
 
@@ -326,7 +336,7 @@ write (int fd, const void *buffer, unsigned size) {
 	}
 }
 
-void
+static void
 seek (int fd, unsigned position) {
 	struct thread *curr_thread = thread_current();
 	struct file **fdt = curr_thread->fdt;
@@ -335,7 +345,7 @@ seek (int fd, unsigned position) {
 	file_seek (curr_file, position);
 }
 
-unsigned
+static unsigned
 tell (int fd) {
 	struct thread *curr_thread = thread_current();
 	struct file **fdt = curr_thread->fdt;
@@ -357,13 +367,101 @@ close (int fd) {// FIXME: next_fd 갱신 로직 최적화
 	}
 }
 
-bool
+// static void *
+// mmap (void *addr, size_t length, int writable, int fd, off_t offset) {
+// 	if(is_invalid_mmap(addr, length, fd)){
+// 		return NULL;
+//     }
+
+// 	size_t copy_length = length;
+// 	while (copy_length > 0)
+// 	{
+// 		/* fix: init인자 값 수정해야함 */
+// 		if(!vm_alloc_page_with_initializer(VM_FILE, addr, writable, NULL, NULL)){
+// 			return NULL;
+// 		}
+		
+// 		copy_length -= PGSIZE;
+// 	}
+// }
+
+// static size_t
+// get_copy_length (size_t *length) {
+// 	size_t return_value = 0;
+
+// 	if(*length >= PGSIZE) {
+// 		*length -= PGSIZE;
+// 		return_value = PGSIZE;
+// 	} else {
+// 		return_value = length;
+// 		*length = 0;
+// 	}
+
+// 	return return_value;
+// }
+
+static void *
+mmap (void *addr, size_t length, int writable, int fd, off_t offset) {
+	/* TODO:
+			- 인자들의 예외 처리
+			- 예외 처리를 통과하면 do_mmap함수를 호출한다
+			- file을 가져와서 do_mmap의 인자로 넘겨준다
+	 */
+	if(!is_invalid_mmap(addr, length, fd)){
+		return NULL;
+	}
+	struct file *file = thread_current()->fdt[fd];
+	if(file == NULL){ // file 유효성 검사
+		return NULL;
+	}
+
+	return do_mmap(addr, length, writable, file, offset);
+}
+
+static bool
+is_invalid_mmap(void *addr, size_t length, int fd){
+	/* TODO: 
+	 		- addr이 0인 경우 OK
+			- fd로 열린 파일이 0바이트인 경우 OK
+	 		- addr이 페이지 정렬되지 않은 경우 OK
+	 		- 이미 있는 페이지에 덮어씌울 경우 OK
+	 		- length가 0인 경우 OK
+	 		- fd가 stdin/stdout인 경우 OK
+	*/
+	if(addr == 0){
+		return false;
+	}
+	else if(filesize(fd) == 0){
+		return false;
+	}
+	else if(pg_ofs(addr) != 0){
+		return false;
+	}
+	else if(spt_find_page(&thread_current()->spt, addr)){
+		return false;
+	}
+	else if(length <= 0){
+		return false;
+	}
+	else if(fd == 1 || fd == 0){
+		return false;
+	}
+	else{
+		return true;
+	}
+}
+
+static void munmap(void *addr){
+	do_munmap(addr);
+}
+
+static bool
 is_invalid_fd(int fd)
 {
 	return fd < 0 || fd >= FD_LIMIT_LEN;
 }
 
-void
+static void
 intr_frame_cpy(struct intr_frame *f) {
 	struct thread *curr_thread = thread_current();
 
